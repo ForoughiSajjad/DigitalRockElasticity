@@ -73,6 +73,7 @@ def parse_input(filename, comm):
     materials = {}
     image_name = None
     voxel_size = None
+    coarsenLevel= None
     image_name = None
     uniaxial_direction = None
     poreLabel = None
@@ -95,6 +96,11 @@ def parse_input(filename, comm):
                     raise ValueError("Second line must specify voxel_size")
                 voxel_size = float(line.split('=')[1].strip())
 
+                line = f.readline().strip()
+                if not line.startswith('coarsening_level'):
+                    raise ValueError("Second line must specify coarsening_level")
+                coarsenLevel = float(line.split('=')[1].strip())                
+                
                 line = f.readline().strip()
                 if not line.startswith('pore_label'):
                     raise ValueError("Third line must specify pore_label")
@@ -142,7 +148,13 @@ def parse_input(filename, comm):
     image_name = comm.bcast(image_name, root=0)
     voxel_size = comm.bcast(voxel_size, root=0)
     materials = comm.bcast(materials, root=0)
-    return image_name, uniaxial_direction, voxel_size, poreLabel, materials
+    
+    # ADD THESE
+    uniaxial_direction = comm.bcast(uniaxial_direction, root=0)
+    coarsenLevel = comm.bcast(coarsenLevel, root=0)
+    poreLabel = comm.bcast(poreLabel, root=0)
+    
+    return image_name, uniaxial_direction, voxel_size, coarsenLevel, poreLabel, materials
 
 # --- Main Script 
 start_time = time.time()
@@ -169,7 +181,7 @@ solver_params = {
 
 try:
     # Parse input file and distribute parameters
-    image_name, uniaxial_direction, voxel_size_orig, poreLabel, materials = parse_input(input_file, comm)
+    image_name, uniaxial_direction, voxel_size_orig, coarsenLevel, poreLabel, materials  = parse_input(input_file, comm)
 except RuntimeError:
     if comm.rank == 0:
         print("Exiting due to input error", file=sys.stderr)
@@ -261,11 +273,22 @@ if comm.rank == 0:
 
 update_peak_memory()
 # Define the mesh (single precision coordinates)
-coarsenLevel = 1
+coarsenLevel = 2
+def cells_after_coarsening(nx, ny, nz, factor, min_cells=2):
+    # factor can be float (e.g., 1.5 means ~1.5× coarser; <1 means refine)
+    n_new = (
+        max(min_cells, int(round(nx / factor))),
+        max(min_cells, int(round(ny / factor))),
+        max(min_cells, int(round(nz / factor))),
+    )
+    return n_new
+
+n0 = cells_after_coarsening(nx, ny, nz, coarsenLevel)
+
 domain = mesh.create_box(
     comm=comm,
     points=[(0.0, 0.0, 0.0), (Lx, Ly, Lz)],
-    n=[nx//coarsenLevel, ny//coarsenLevel, nz//coarsenLevel],
+    n= n0, #[nx//coarsenLevel, ny//coarsenLevel, nz//coarsenLevel],
     cell_type=CellType.hexahedron,
     dtype=np.float64,  # Required for compatibility with FEM
     ghost_mode=GhostMode.shared_facet,
