@@ -1,0 +1,8 @@
+image_name = "spheres.tif"
+uniaxial_direction = "x"
+voxel_size = 1
+coarsening_level = 1
+pore_label = 0
+phase   K	G
+0	0.0001	0.0001
+1	37.0	44.0
