@@ -156,6 +156,20 @@ def parse_input(filename, comm):
     
     return image_name, uniaxial_direction, voxel_size, coarsenLevel, poreLabel, materials
 
+def ksp_report(problem, label, comm):
+    """Return (converged_reason, iterations) of the KSP used by a LinearProblem."""
+    ksp = getattr(problem, "solver", None) or getattr(problem, "_solver", None)
+    if ksp is None:
+        return 0, -1
+    reason, its = ksp.getConvergedReason(), ksp.getIterationNumber()
+    if comm.rank == 0:
+        status = "converged" if reason > 0 else "NOT CONVERGED"
+        print(f"{label} solve: KSP reason {reason} ({status}), iterations {its}")
+        if reason <= 0:
+            print(f"WARNING: {label} solve did not converge", file=sys.stderr)
+        sys.stdout.flush()
+    return reason, its
+
 # --- Main Script 
 start_time = time.time()
 comm = MPI.COMM_WORLD
@@ -174,14 +188,14 @@ solver_params = {
     "pc_hypre_boomeramg_truncfactor": 0.05,
     "pc_hypre_boomeramg_max_levels": 25,
     "mat_type": "aij",
-    "ksp_max_it": 2000,
+    "ksp_max_it": 5000,
     "ksp_norm_type": "unpreconditioned",
     # Removed 'memory_optimized' as it's not a standard PETSc option
 }
 
 try:
     # Parse input file and distribute parameters
-    image_name, uniaxial_direction, voxel_size_orig, coarsenLevel, poreLabel, materials  = parse_input(input_file, comm)
+    image_name, uniaxial_direction, voxel_size_orig, coarsenLevel, poreLabel, materials = parse_input(input_file, comm)
 except RuntimeError:
     if comm.rank == 0:
         print("Exiting due to input error", file=sys.stderr)
@@ -273,7 +287,8 @@ if comm.rank == 0:
 
 update_peak_memory()
 # Define the mesh (single precision coordinates)
-coarsenLevel = 2
+#coarsenLevel = 2
+
 def cells_after_coarsening(nx, ny, nz, factor, min_cells=2):
     # factor can be float (e.g., 1.5 means ~1.5× coarser; <1 means refine)
     n_new = (
@@ -396,6 +411,7 @@ problem_vol = LinearProblem(a_form, L_form, bcs=[bc_vol],
                             petsc_options=solver_params_cleaned,
                             u=fem.Function(V))
 u_vol = problem_vol.solve()
+vol_reason, vol_its = ksp_report(problem_vol, "Volumetric", comm)
 # Using float32 for volumetric problem
 print_memory_usage(comm, "Post volumetric solve")
 
@@ -422,94 +438,66 @@ if comm.rank == 0:
     print(f"Volumetric solve complete. K_eff = {K_eff:.4f}")
     sys.stdout.flush()
 
-# Uniaxial Tension BC (strain applied in X direction only)
+# Shear test: affine simple shear imposed on ALL boundary nodes
+# (same kinematic boundary condition as the bulk-modulus test, so the problem is
+#  fully constrained and G_eff is measured directly, without assuming isotropy).
+#   u = (0.5*eps0*y, 0.5*eps0*x, 0)  ->  eps_xy = eps0/2,  G_eff = <sigma_xy>/(2*eps_xy) = <sigma_xy>/eps0
 if comm.rank == 0:
-    print("Setting up Uniaxial BCs (X-dir)...")
+    print("Setting up affine shear BCs (xy plane)...")
     sys.stdout.flush()
-# Identify facets on left (x=0) and right (x=Lx) boundaries
-def left_boundary(x):
-    return np.isclose(x[0], 0.0)
-def right_boundary(x):
-    return np.isclose(x[0], Lx)
-left_facets = mesh.locate_entities_boundary(domain, tdim - 1, left_boundary)
-right_facets = mesh.locate_entities_boundary(domain, tdim - 1, right_boundary)
-# Locate DOFs for x-displacement on those facets (subspace V.sub(0))
-left_dofs_x = fem.locate_dofs_topological(V.sub(0), tdim - 1, left_facets)
-right_dofs_x = fem.locate_dofs_topological(V.sub(0), tdim - 1, right_facets)
-# Convert dof index arrays to int32 (contiguous)
-left_dofs_x = np.asarray(left_dofs_x, dtype=np.int32)
-right_dofs_x = np.asarray(right_dofs_x, dtype=np.int32)
-delta_x = epsilon0 * Lx  # Applied displacement on right face corresponding to strain
-bc_left = dirichletbc(PETSc.ScalarType(0.0), left_dofs_x, V.sub(0))
-bc_right = dirichletbc(PETSc.ScalarType(delta_x), right_dofs_x, V.sub(0))
+u_bc_sh = fem.Function(V)
+u_bc_sh.interpolate(lambda x: np.vstack((0.5 * epsilon0 * x[1],
+                                         0.5 * epsilon0 * x[0],
+                                         np.zeros_like(x[2]))))
+bc_sh = dirichletbc(u_bc_sh, boundary_dofs_all)
 
-# Solve for Young's Modulus (E_eff) using float32 linear system
-if comm.rank == 0: 
-    print("Solving Uniaxial problem...")
+if comm.rank == 0:
+    print("Solving shear problem...")
     sys.stdout.flush()
-problem_uni = LinearProblem(a_form, L_form, bcs=[bc_left, bc_right],
-                            petsc_options=solver_params_cleaned,
-                            u=fem.Function(V))
-u_uni = problem_uni.solve()
+problem_sh = LinearProblem(a_form, L_form, bcs=[bc_sh],
+                           petsc_options=solver_params_cleaned,
+                           u=fem.Function(V))
+u_sh = problem_sh.solve()
+sh_reason, sh_its = ksp_report(problem_sh, "Shear", comm)
 
-# Compute effective Young's modulus E_eff
-sigma_uni_expr = sigma(u_uni, E_func, nu_func)
-sigma_xx_uni = sigma_uni_expr[0, 0]
-sigma_xx_form = fem.form(sigma_xx_uni * dx_measure)
-sigma_xx_local = fem.assemble_scalar(sigma_xx_form)
-total_sigma_xx = comm.allreduce(sigma_xx_local, op=MPI.SUM)
+sigma_xy_form = fem.form(sigma(u_sh, E_func, nu_func)[0, 1] * dx_measure)
+total_sigma_xy = comm.allreduce(fem.assemble_scalar(sigma_xy_form), op=MPI.SUM)
 update_peak_memory()
 if total_volume < 1e-12 or abs(epsilon0) < 1e-12:
-    E_eff = 0.0
+    G_eff = 0.0
     if comm.rank == 0:
-        print("Warning: Total volume or applied strain is near zero. E_eff set to 0.")
+        print("Warning: Total volume or applied strain is near zero. G_eff set to 0.")
 else:
-    E_eff = (total_sigma_xx / total_volume) / epsilon0
+    G_eff = (total_sigma_xy / total_volume) / epsilon0
+
+# Young's modulus and Poisson's ratio for reference (isotropic relations)
+E_eff = 9.0 * K_eff * G_eff / (3.0 * K_eff + G_eff) if (3.0 * K_eff + G_eff) > 1e-12 else 0.0
+nu_eff = (3.0 * K_eff - 2.0 * G_eff) / (2.0 * (3.0 * K_eff + G_eff)) if (3.0 * K_eff + G_eff) > 1e-12 else 0.0
 if comm.rank == 0:
-    print(f"Uniaxial solve complete. E_eff = {E_eff:.4f}")
+    print(f"Shear solve complete. G_eff = {G_eff:.4f}")
     sys.stdout.flush()
 
-# Clean up uniaxial problem and BCs to free memory
-del problem_uni, bc_left, bc_right
-gc.collect()
-# Free material property functions now that solving is done
+# Clean up
+del problem_sh, bc_sh, u_bc_sh
 del E_func, nu_func
 gc.collect()
-
-# Calculate Effective Shear Modulus (G_eff) from K_eff and E_eff
-G_eff = 0.0
-if abs(E_eff) > 1e-12 and abs(K_eff) > 1e-12:
-    denominator_nu = 6.0 * K_eff
-    if abs(denominator_nu) > 1e-12:
-        nu_eff = (3.0 * K_eff - E_eff) / denominator_nu
-        if -1.0 < nu_eff < 0.5:
-            denominator_G = 2.0 * (1.0 + nu_eff)
-            if abs(denominator_G) > 1e-12:
-                G_eff = E_eff / denominator_G
-            elif comm.rank == 0:
-                print(f"Warning: Denominator (2*(1+nu_eff)) is near zero ({denominator_G:.2e}). Cannot compute G_eff.", file=sys.stderr)
-        elif comm.rank == 0:
-            print(f"Warning: Derived effective Poisson's ratio ({nu_eff:.4f}) is non-physical. Cannot compute G_eff.", file=sys.stderr)
-    elif comm.rank == 0:
-        print(f"Warning: Denominator (6*K_eff) for nu_eff is near zero ({denominator_nu:.2e}). Cannot compute G_eff.", file=sys.stderr)
-elif comm.rank == 0:
-    print("Warning: Effective E or K is near zero. Cannot reliably compute G_eff.", file=sys.stderr)
 
 # --- Final Output (printing results) ---
 end_time = time.time()
 # (Peak memory `peak_memory` and other outputs recorded as before)
 if comm.rank == 0:
     print("\n--- Effective Properties ---")
-    unit = "MPa"  # Adjust unit if input K,G given in different units
+    unit = "GPa"  # same units as the input K, G
     print(f"Effective Bulk Modulus (K_eff): {K_eff:.4f} {unit}")
-    print(f"Effective Young's Modulus (E_eff): {E_eff:.4f} {unit}")
-    print(f"Effective Shear Modulus (G_eff): {G_eff:.4f} {unit} (Derived)")
+    print(f"Effective Young's Modulus (E_eff): {E_eff:.4f} {unit} (from K, G)")
+    print(f"Effective Shear Modulus (G_eff): {G_eff:.4f} {unit} (affine shear)")
+    print(f"Effective Poisson's ratio: {nu_eff:.4f}")
     print(f"Effective Porosity: {exportPorosity*100.0:.2f}%")
     print(f"Fractal Dimension: {fractalDImension:.4f}")
     print(f"Total Execution time: {end_time - start_time:.2f} seconds")
     print("--------------------------")
     # Save results to file
-    output_filename = f"modulus_output_{image_name.replace('.', '_')}_factor{downsample_factor}_{uniaxial_direction}.txt"
+    output_filename = f"modulus_output_{image_name.replace('.', '_')}_factor{coarsenLevel}_{uniaxial_direction}.txt"
     try:
         with open(output_filename, 'w') as f:
             f.write(f"Image: {image_name}\n")
@@ -523,6 +511,9 @@ if comm.rank == 0:
             f.write(f"K_eff: {K_eff:.4f} {unit}\n")
             f.write(f"E_eff: {E_eff:.4f} {unit}\n")
             f.write(f"G_eff: {G_eff:.4f} {unit}\n")
+            f.write(f"nu_eff: {nu_eff:.4f}\n")
+            f.write(f"Volumetric KSP reason: {vol_reason}, iterations: {vol_its}\n")
+            f.write(f"Shear KSP reason: {sh_reason}, iterations: {sh_its}\n")
             f.write(f"Effective Porosity: {exportPorosity*100.0:.2f}%\n")
             f.write(f"Peak memory usage: {peak_memory:.2f} MB\n")
             f.write("---\n")
