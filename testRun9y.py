@@ -1,3 +1,12 @@
+"""
+DigitalRockElasticity: effective elastic moduli of a segmented 3D micro-CT image.
+
+Usage (see README.md):
+    mpirun -n <N> python3 testRun9y.py [input_file]
+
+If no input file is given, "input_y.dat" in the current directory is used.
+The numerical method is unchanged; this header only documents the script.
+"""
 import numpy as np
 import ufl
 from mpi4py import MPI
@@ -174,7 +183,7 @@ def ksp_report(problem, label, comm):
 start_time = time.time()
 comm = MPI.COMM_WORLD
 
-input_file = "input_y.dat"
+input_file = sys.argv[1] if len(sys.argv) > 1 else "input_y.dat"
 downsample_factor = 1
 
 solver_params = {

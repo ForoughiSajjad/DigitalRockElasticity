@@ -1,6 +1,7 @@
 image_name = "subvolume.tif"
 uniaxial_direction = "x"
 voxel_size = 5
+coarsening_level = 1
 pore_label = 0
 phase   K	G
 0	0.0001	0.0001
